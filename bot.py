@@ -19,9 +19,9 @@ from telegram.ext import (
 )
 
 # ─── تنظیمات ────────────────────────────────────────────────
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # توکن ربات از BotFather
-ADMIN_IDS = [123456789]                    # آیدی عددی ادمین‌ها
-CHANNEL_ID = "@your_storage_channel"       # کانال ذخیره‌سازی (ربات باید ادمین کانال باشه)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "0").split(",") if x.strip().isdigit()]
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DB_FILE = "database.json"
 
 # ─── دیتابیس ────────────────────────────────────────────────
@@ -421,3 +421,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                
