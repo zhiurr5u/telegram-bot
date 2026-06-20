@@ -40,25 +40,95 @@ DEFAULT_TEXTS = {
 }
 
 # ═══════════════════════════════════════════
-#   دیتابیس ساده JSON
+#   دیتابیس - SQLite (امن برای استفاده همزمان)
 # ═══════════════════════════════════════════
+import sqlite3
+import threading
+
+DB_FILE = "database.db"
+_db_lock = threading.Lock()
+
+def _get_conn():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")   # اجازه خوندن/نوشتن همزمان بدون قفل کامل فایل
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;") # تا ۳۰ ثانیه صبر کنه به‌جای کرش کردن موقع شلوغی
+    return conn
+
+def _init_db():
+    conn = _get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kv_store (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            data TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO kv_store (id, data) VALUES (1, ?)
+    """, (json.dumps({
+        "users": {}, "files": {}, "banned": [], "texts": {},
+        "join_channels": [], "required_task": None,
+        "admins_extra": [], "packs": {},
+    }),))
+    conn.commit()
+    conn.close()
+
+_init_db()
+
 def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {
-        "users": {},
-        "files": {},
-        "banned": [],
-        "texts": {},
-        "join_channels": [],   # [{"id":"@x","title":"x"}]
-        "required_task": None, # {"link": "...", "label": "..."}
-        "admins_extra": [],
-    }
+    """می‌خونه و یه دیکشنری برمی‌گردونه - دقیقاً مثل قبل"""
+    with _db_lock:
+        conn = _get_conn()
+        row = conn.execute("SELECT data FROM kv_store WHERE id = 1").fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0])
+        return {
+            "users": {}, "files": {}, "banned": [], "texts": {},
+            "join_channels": [], "required_task": None,
+            "admins_extra": [], "packs": {},
+        }
 
 def save_db(db):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+    """می‌نویسه - دقیقاً مثل قبل، ولی امن برای همزمانی"""
+    with _db_lock:
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE kv_store SET data = ? WHERE id = 1",
+            (json.dumps(db, ensure_ascii=False),)
+        )
+        conn.commit()
+        conn.close()
+
+class db_transaction:
+    """
+    برای جاهایی که چند نفر ممکنه همزمان یه عدد رو تغییر بدن
+    (مثل شمارش دانلود، لایک، ثبت کاربر جدید) از این استفاده کن
+    تا تغییرات گم نشه:
+
+        with db_transaction() as db:
+            db["files"][code]["downloads"] += 1
+        # خودش ذخیره می‌کنه و قفل رو آزاد می‌کنه
+    """
+    def __enter__(self):
+        _db_lock.acquire()
+        self._conn = _get_conn()
+        row = self._conn.execute("SELECT data FROM kv_store WHERE id = 1").fetchone()
+        self._db = json.loads(row[0]) if row else {}
+        return self._db
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self._conn.execute(
+                    "UPDATE kv_store SET data = ? WHERE id = 1",
+                    (json.dumps(self._db, ensure_ascii=False),)
+                )
+                self._conn.commit()
+        finally:
+            self._conn.close()
+            _db_lock.release()
+        return False
 
 def get_text(key, **kwargs):
     db = load_db()
@@ -76,17 +146,16 @@ def is_admin(user_id):
     return user_id in all_admin_ids()
 
 def register_user(user):
-    db = load_db()
-    uid = str(user.id)
-    if uid not in db["users"]:
-        db["users"][uid] = {
-            "id": user.id, "name": user.full_name,
-            "username": user.username or "",
-            "joined": datetime.now().isoformat(),
-            "downloads": 0
-        }
-        save_db(db)
-    return db
+    with db_transaction() as db:
+        uid = str(user.id)
+        if uid not in db["users"]:
+            db["users"][uid] = {
+                "id": user.id, "name": user.full_name,
+                "username": user.username or "",
+                "joined": datetime.now().isoformat(),
+                "downloads": 0
+            }
+    return load_db()
 
 def is_banned(user_id):
     db = load_db()
@@ -145,28 +214,28 @@ def file_reaction_keyboard(file_code, likes=0, dislikes=0):
 async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     action, code = q.data.split("_", 1)
-    db = load_db()
-    if code not in db["files"]:
-        await q.answer("فایل پیدا نشد", show_alert=True); return
-    f = db["files"][code]
-    f.setdefault("liked_by", []); f.setdefault("disliked_by", [])
-    uid = q.from_user.id
-    if action == "like":
-        if uid in f["liked_by"]:
-            f["liked_by"].remove(uid)
+    with db_transaction() as db:
+        if code not in db["files"]:
+            await q.answer("فایل پیدا نشد", show_alert=True); return
+        f = db["files"][code]
+        f.setdefault("liked_by", []); f.setdefault("disliked_by", [])
+        uid = q.from_user.id
+        if action == "like":
+            if uid in f["liked_by"]:
+                f["liked_by"].remove(uid)
+            else:
+                f["liked_by"].append(uid)
+                if uid in f["disliked_by"]: f["disliked_by"].remove(uid)
         else:
-            f["liked_by"].append(uid)
-            if uid in f["disliked_by"]: f["disliked_by"].remove(uid)
-    else:
-        if uid in f["disliked_by"]:
-            f["disliked_by"].remove(uid)
-        else:
-            f["disliked_by"].append(uid)
-            if uid in f["liked_by"]: f["liked_by"].remove(uid)
-    save_db(db)
+            if uid in f["disliked_by"]:
+                f["disliked_by"].remove(uid)
+            else:
+                f["disliked_by"].append(uid)
+                if uid in f["liked_by"]: f["liked_by"].remove(uid)
+        likes, dislikes = len(f["liked_by"]), len(f["disliked_by"])
     try:
         await q.edit_message_reply_markup(
-            reply_markup=file_reaction_keyboard(code, len(f["liked_by"]), len(f["disliked_by"]))
+            reply_markup=file_reaction_keyboard(code, likes, dislikes)
         )
     except TelegramError:
         pass
@@ -222,9 +291,9 @@ async def deliver_file(update_or_query, context, file_code, chat_id):
             caption=caption,
             reply_markup=kb,
         )
-        db = load_db()
-        db["files"][file_code]["downloads"] = db["files"][file_code].get("downloads", 0) + 1
-        save_db(db)
+        with db_transaction() as db:
+            if file_code in db["files"]:
+                db["files"][file_code]["downloads"] = db["files"][file_code].get("downloads", 0) + 1
         extra = get_text("file_sent_extra")
         if extra:
             await context.bot.send_message(chat_id=chat_id, text=extra)
