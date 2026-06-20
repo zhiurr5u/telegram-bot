@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, json, asyncio
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -134,10 +134,13 @@ def task_keyboard(link, file_code=None):
 #   لایک/دیسلایک
 # ═══════════════════════════════════════════
 def file_reaction_keyboard(file_code, likes=0, dislikes=0):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"👍 {likes}", callback_data=f"like_{file_code}"),
-        InlineKeyboardButton(f"👎 {dislikes}", callback_data=f"dislike_{file_code}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"👍 {likes}", callback_data=f"like_{file_code}"),
+            InlineKeyboardButton(f"👎 {dislikes}", callback_data=f"dislike_{file_code}"),
+        ],
+        [InlineKeyboardButton("💬 ارسال نظر", callback_data=f"comment_{file_code}")],
+    ])
 
 async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -168,6 +171,36 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
     await q.answer("✅ ثبت شد")
+
+async def callback_comment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    file_code = q.data.split("_", 1)[1]
+    context.user_data["awaiting"] = "user_comment"
+    context.user_data["comment_file"] = file_code
+    await q.answer()
+    await context.bot.send_message(chat_id=q.from_user.id, text="💬 نظرت رو بنویس و بفرست تا برای ادمین ارسال بشه:")
+
+async def receive_user_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """وقتی کاربر (غیر ادمین) تو حالت ارسال نظره"""
+    user = update.effective_user
+    file_code = context.user_data.pop("comment_file", None)
+    context.user_data.pop("awaiting", None)
+    db = load_db()
+    file_name = db["files"].get(file_code, {}).get("name", "نامشخص") if file_code else "—"
+    text = (
+        f"💬 نظر جدید از کاربر\n\n"
+        f"👤 {user.full_name} (@{user.username or '—'})\n"
+        f"🆔 `{user.id}`\n"
+        f"📁 فایل: {file_name}\n\n"
+        f"📝 متن نظر:\n{update.message.text}"
+    )
+    for admin_id in all_admin_ids():
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+    await update.message.reply_text("✅ نظرت برای ادمین ارسال شد. ممنون از بازخوردت!")
+
 
 # ═══════════════════════════════════════════
 #   ارسال فایل به کاربر (کپی، نه فوروارد)
@@ -202,7 +235,7 @@ async def deliver_file(update_or_query, context, file_code, chat_id):
 # ═══════════════════════════════════════════
 #   جریان دریافت فایل: بن؟ → عضویت؟ → وظیفه؟ → ارسال
 # ═══════════════════════════════════════════
-async def try_deliver_with_gates(update: Update, context: ContextTypes.DEFAULT_TYPE, file_code):
+async def try_deliver_with_gates(update: Update, context: ContextTypes.DEFAULT_TYPE, file_code, is_pack=False):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
@@ -213,6 +246,7 @@ async def try_deliver_with_gates(update: Update, context: ContextTypes.DEFAULT_T
     ok, missing = await check_join(context.bot, user.id)
     if not ok:
         context.user_data["pending_file"] = file_code
+        context.user_data["pending_is_pack"] = is_pack
         await context.bot.send_message(
             chat_id=chat_id,
             text=get_text("join_required", channels="\n".join(f"• {c['title']}" for c in missing)),
@@ -224,6 +258,7 @@ async def try_deliver_with_gates(update: Update, context: ContextTypes.DEFAULT_T
     task = db.get("required_task")
     if task and str(user.id) not in task.get("done_by", []):
         context.user_data["pending_file"] = file_code
+        context.user_data["pending_is_pack"] = is_pack
         await context.bot.send_message(
             chat_id=chat_id,
             text=get_text("task_required", link=task["link"]),
@@ -231,7 +266,10 @@ async def try_deliver_with_gates(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    await deliver_file(update, context, file_code, chat_id)
+    if is_pack:
+        await deliver_pack(update, context, file_code, chat_id)
+    else:
+        await deliver_file(update, context, file_code, chat_id)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -246,10 +284,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await try_deliver_with_gates(update, context, file_code)
         return
 
+    if context.args and context.args[0].startswith("pack_"):
+        pack_code = context.args[0][5:]
+        await try_deliver_with_gates(update, context, pack_code, is_pack=True)
+        return
+
     text = get_text("start", name=user.first_name)
     if is_admin(user.id):
         text += get_text("start_admin_suffix")
-    await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=admin_reply_keyboard())
+    else:
+        await update.message.reply_text(text)
+
+
 
 async def callback_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -264,7 +311,8 @@ async def callback_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE
     except TelegramError:
         pass
     if file_code:
-        await try_deliver_with_gates(update, context, file_code)
+        is_pack = context.user_data.get("pending_is_pack", False)
+        await try_deliver_with_gates(update, context, file_code, is_pack=is_pack)
 
 async def callback_check_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -283,33 +331,96 @@ async def callback_check_task(update: Update, context: ContextTypes.DEFAULT_TYPE
     except TelegramError:
         pass
     if file_code:
-        await try_deliver_with_gates(update, context, file_code)
+        is_pack = context.user_data.get("pending_is_pack", False)
+        await try_deliver_with_gates(update, context, file_code, is_pack=is_pack)
 
 # ═══════════════════════════════════════════
-#   آپلود فایل توسط ادمین
+#   آپلود فایل توسط ادمین (تکی / گروهی)
 # ═══════════════════════════════════════════
+
+BTN_UPLOAD_SINGLE = "📤 آپلود تکی"
+BTN_UPLOAD_GROUP  = "📦 آپلود گروهی"
+BTN_GROUP_FINISH  = "✅ پایان آپلود گروهی"
+
+def admin_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        [[BTN_UPLOAD_SINGLE, BTN_UPLOAD_GROUP]],
+        resize_keyboard=True
+    )
+
+def group_active_keyboard():
+    return ReplyKeyboardMarkup([[BTN_GROUP_FINISH]], resize_keyboard=True)
+
+def extract_file_info(msg):
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo.jpg", "photo"
+    if msg.video:
+        return msg.video.file_id, msg.video.file_name or "video.mp4", "video"
+    if msg.document:
+        return msg.document.file_id, msg.document.file_name or "file", "document"
+    if msg.audio:
+        return msg.audio.file_id, msg.audio.file_name or "audio.mp3", "audio"
+    if msg.voice:
+        return msg.voice.file_id, "voice.ogg", "voice"
+    return None, None, None
+
+async def start_single_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(get_text("no_access")); return
+    context.user_data["upload_mode"] = "single"
+    context.user_data.pop("group_pack", None)
+    await update.message.reply_text(
+        "📤 حالت آپلود تکی فعاله.\nهر فایلی بفرستی، لینک جدا براش ساخته می‌شه.",
+        reply_markup=admin_reply_keyboard()
+    )
+
+async def start_group_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(get_text("no_access")); return
+    context.user_data["upload_mode"] = "group"
+    context.user_data["group_pack"] = []
+    await update.message.reply_text(
+        "📦 حالت آپلود گروهی فعاله.\nفایل‌ها رو پشت سر هم بفرست، آخرش «✅ پایان آپلود گروهی» رو بزن.",
+        reply_markup=group_active_keyboard()
+    )
+
+async def finish_group_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text(get_text("no_access")); return
+    pack = context.user_data.get("group_pack", [])
+    if not pack:
+        await update.message.reply_text("هنوز فایلی تو این پک نفرستادی.", reply_markup=group_active_keyboard())
+        return
+    db = load_db()
+    pack_code = f"pack{pack[0]}{len(pack)}{int(datetime.now().timestamp())%100000}"
+    db.setdefault("packs", {})[pack_code] = {
+        "code": pack_code, "files": pack, "uploaded_by": user.id,
+        "uploaded_at": datetime.now().isoformat(), "downloads": 0,
+    }
+    save_db(db)
+    me = (await context.bot.get_me()).username
+    link = f"https://t.me/{me}?start=pack_{pack_code}"
+    context.user_data["upload_mode"] = "single"
+    context.user_data.pop("group_pack", None)
+    await update.message.reply_text(
+        f"✅ پک گروهی ساخته شد!\n📦 تعداد فایل‌ها: {len(pack)}\n🔑 کد: `{pack_code}`\n\n🔗 لینک مشترک:\n`{link}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_reply_keyboard()
+    )
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text(get_text("not_admin"))
         return
     msg = update.message
-    wait = await msg.reply_text(get_text("processing"))
-
-    if msg.photo:
-        file_id, file_name, file_type = msg.photo[-1].file_id, "photo.jpg", "photo"
-    elif msg.video:
-        file_id, file_name, file_type = msg.video.file_id, msg.video.file_name or "video.mp4", "video"
-    elif msg.document:
-        file_id, file_name, file_type = msg.document.file_id, msg.document.file_name or "file", "document"
-    elif msg.audio:
-        file_id, file_name, file_type = msg.audio.file_id, msg.audio.file_name or "audio.mp3", "audio"
-    elif msg.voice:
-        file_id, file_name, file_type = msg.voice.file_id, "voice.ogg", "voice"
-    else:
-        await wait.edit_text(get_text("unsupported")); return
+    file_id, file_name, file_type = extract_file_info(msg)
+    if not file_id:
+        await msg.reply_text(get_text("unsupported")); return
 
     custom_caption = msg.caption if msg.caption else None
+    mode = context.user_data.get("upload_mode", "single")
 
     try:
         fwd = await msg.forward(chat_id=CHANNEL_ID)
@@ -323,15 +434,38 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "custom_caption": custom_caption,
         }
         save_db(db)
-        me = (await context.bot.get_me()).username
-        link = f"https://t.me/{me}?start=file_{code}"
-        await wait.edit_text(
-            f"✅ آپلود شد!\n📁 {file_name}\n🔑 کد: `{code}`\n\n🔗 لینک:\n`{link}`\n\n"
-            f"💡 برای تغییر کپشن این فایل از پنل ادمین استفاده کن.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+
+        if mode == "group":
+            context.user_data.setdefault("group_pack", []).append(code)
+            count = len(context.user_data["group_pack"])
+            await msg.reply_text(f"➕ اضافه شد به پک ({count} فایل تا الان). ادامه بده یا «✅ پایان آپلود گروهی» رو بزن.")
+        else:
+            me = (await context.bot.get_me()).username
+            link = f"https://t.me/{me}?start=file_{code}"
+            await msg.reply_text(
+                f"✅ آپلود شد!\n📁 {file_name}\n🔑 کد: `{code}`\n\n🔗 لینک:\n`{link}`\n\n"
+                f"💡 برای تغییر کپشن این فایل از پنل ادمین استفاده کن.",
+                parse_mode=ParseMode.MARKDOWN
+            )
     except TelegramError as e:
-        await wait.edit_text(f"❌ خطا: {e}\n⚠️ ربات باید ادمین کانال ذخیره باشه.")
+        await msg.reply_text(f"❌ خطا: {e}\n⚠️ ربات باید ادمین کانال ذخیره باشه.")
+
+async def deliver_pack(update_or_query, context, pack_code, chat_id):
+    db = load_db()
+    if pack_code not in db.get("packs", {}):
+        await context.bot.send_message(chat_id=chat_id, text=get_text("file_not_found"))
+        return
+    pack = db["packs"][pack_code]
+    await context.bot.send_message(chat_id=chat_id, text=f"📦 ارسال پک ({len(pack['files'])} فایل)...")
+    for code in pack["files"]:
+        await deliver_file(update_or_query, context, code, chat_id)
+        await asyncio.sleep(0.3)
+    db = load_db()
+    if pack_code in db.get("packs", {}):
+        db["packs"][pack_code]["downloads"] = db["packs"][pack_code].get("downloads", 0) + 1
+        save_db(db)
+
+
 
 # ═══════════════════════════════════════════
 #   پنل ادمین - منوی اصلی
@@ -559,7 +693,21 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user)
+    text_raw = update.message.text.strip() if update.message.text else ""
     awaiting = context.user_data.get("awaiting")
+
+    # دکمه‌های کیبورد ادمین (آپلود تکی/گروهی)
+    if is_admin(user.id):
+        if text_raw == BTN_UPLOAD_SINGLE:
+            await start_single_upload(update, context); return
+        if text_raw == BTN_UPLOAD_GROUP:
+            await start_group_upload(update, context); return
+        if text_raw == BTN_GROUP_FINISH:
+            await finish_group_upload(update, context); return
+
+    # کاربر عادی در حال ارسال نظره
+    if awaiting == "user_comment" and not is_admin(user.id):
+        await receive_user_comment(update, context); return
 
     if not is_admin(user.id) or not awaiting:
         if is_banned(user.id):
@@ -567,7 +715,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(get_text("default_reply"))
         return
 
-    text = update.message.text.strip()
+    text = text_raw
     db = load_db()
 
     if awaiting == "ban":
@@ -705,6 +853,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.data.startswith("like_") or q.data.startswith("dislike_"):
         await handle_reaction(update, context)
+    elif q.data.startswith("comment_"):
+        await callback_comment_start(update, context)
     elif q.data.startswith("checkjoin_"):
         await callback_check_join(update, context)
     elif q.data.startswith("checktask_"):
