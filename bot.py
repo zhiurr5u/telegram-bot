@@ -496,4 +496,243 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "m_task":
-        task = db.get("required_task"
+        task = db.get("required_task")
+        status = f"فعلی: {task['link']}" if task else "فعلاً تنظیم نشده."
+        await q.edit_message_text(f"🔗 وظیفه اجباری\n\n{status}", reply_markup=task_menu()); return
+
+    if data == "t_set":
+        context.user_data["awaiting"] = "task_set"
+        await q.edit_message_text("🔗 لینکی که کاربر باید روش کلیک کنه رو بفرست:", reply_markup=back_kb("m_task")); return
+
+    if data == "t_remove":
+        db["required_task"] = None
+        save_db(db)
+        await q.edit_message_text("✅ وظیفه اجباری حذف شد.", reply_markup=back_kb("m_task")); return
+
+    if data == "m_broadcast":
+        context.user_data["awaiting"] = "broadcast"
+        await q.edit_message_text("📢 پیامی که می‌خوای برای همه ارسال بشه رو بفرست:", reply_markup=back_kb("m_back")); return
+
+    if data == "m_dm":
+        context.user_data["awaiting"] = "dm_id"
+        await q.edit_message_text("✉️ آیدی عددی کاربر مقصد رو بفرست:", reply_markup=back_kb("m_back")); return
+
+    if data == "m_texts":
+        await q.edit_message_text("✏️ کدوم متن رو می‌خوای تغییر بدی؟", reply_markup=texts_menu()); return
+
+    if data.startswith("tx_"):
+        key = data[3:]
+        context.user_data["awaiting"] = f"text_{key}"
+        current = get_text(key)
+        await q.edit_message_text(
+            f"متن فعلی:\n\n{current}\n\n— متن جدید رو بفرست (می‌تونی از {{name}} برای متن start و {{channels}}/{{link}} در بقیه استفاده کنی):",
+            reply_markup=back_kb("m_texts")
+        ); return
+
+    if data == "m_admins":
+        await q.edit_message_text("👑 مدیریت ادمین‌ها", reply_markup=admins_menu()); return
+
+    if data == "a_add":
+        context.user_data["awaiting"] = "admin_add"
+        await q.edit_message_text("➕ آیدی عددی ادمین جدید رو بفرست:", reply_markup=back_kb("m_admins")); return
+
+    if data == "a_list":
+        ids = all_admin_ids()
+        text = "👑 ادمین‌های فعلی:\n\n" + "\n".join(f"• `{i}`" for i in ids)
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb("m_admins")); return
+
+    if data == "m_stats":
+        text = (
+            f"📊 آمار کلی\n\n"
+            f"👥 کاربران: {len(db['users'])}\n"
+            f"🚫 مسدودها: {len(db.get('banned',[]))}\n"
+            f"📁 فایل‌ها: {len(db['files'])}\n"
+            f"📥 دانلودها: {sum(f.get('downloads',0) for f in db['files'].values())}\n"
+            f"👍 لایک‌ها: {sum(len(f.get('liked_by',[])) for f in db['files'].values())}\n"
+            f"👎 دیسلایک‌ها: {sum(len(f.get('disliked_by',[])) for f in db['files'].values())}"
+        )
+        await q.edit_message_text(text, reply_markup=back_kb("m_back")); return
+
+# ═══════════════════════════════════════════
+#   پردازش پیام‌های متنی (ورودی‌های پنل ادمین)
+# ═══════════════════════════════════════════
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user(user)
+    awaiting = context.user_data.get("awaiting")
+
+    if not is_admin(user.id) or not awaiting:
+        if is_banned(user.id):
+            await update.message.reply_text(get_text("banned")); return
+        await update.message.reply_text(get_text("default_reply"))
+        return
+
+    text = update.message.text.strip()
+    db = load_db()
+
+    if awaiting == "ban":
+        if text.lstrip("-").isdigit():
+            uid = int(text)
+            if uid not in db["banned"]:
+                db["banned"].append(uid)
+                save_db(db)
+            await update.message.reply_text(f"🚫 کاربر {uid} بن شد.", reply_markup=main_admin_menu())
+        else:
+            await update.message.reply_text("❌ آیدی نامعتبره. عدد بفرست.")
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "unban":
+        if text.lstrip("-").isdigit():
+            uid = int(text)
+            if uid in db["banned"]:
+                db["banned"].remove(uid)
+                save_db(db)
+                await update.message.reply_text(f"✅ کاربر {uid} آنبن شد.", reply_markup=main_admin_menu())
+            else:
+                await update.message.reply_text("این کاربر تو لیست بن نبود.", reply_markup=main_admin_menu())
+        else:
+            await update.message.reply_text("❌ آیدی نامعتبره. عدد بفرست.")
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "join_add":
+        context.user_data["join_add_id"] = text
+        context.user_data["awaiting"] = "join_add_title"
+        await update.message.reply_text("اسم نمایشی این کانال/گروه رو بفرست:")
+        return
+
+    if awaiting == "join_add_title":
+        ch_id = context.user_data.pop("join_add_id", text)
+        db.setdefault("join_channels", []).append({"id": ch_id, "title": text})
+        save_db(db)
+        await update.message.reply_text(f"✅ اضافه شد: {text}", reply_markup=main_admin_menu())
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "task_set":
+        db["required_task"] = {"link": text, "done_by": []}
+        save_db(db)
+        await update.message.reply_text("✅ وظیفه اجباری تنظیم شد.", reply_markup=main_admin_menu())
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "broadcast":
+        users = list(db["users"].keys())
+        sent = failed = 0
+        status = await update.message.reply_text(f"⏳ ارسال به {len(users)} کاربر...")
+        for uid in users:
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=text)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        await status.edit_text(f"✅ پیام همگانی ارسال شد!\n✔️ موفق: {sent}\n❌ ناموفق: {failed}", reply_markup=main_admin_menu())
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "dm_id":
+        if text.lstrip("-").isdigit():
+            context.user_data["dm_target"] = int(text)
+            context.user_data["awaiting"] = "dm_text"
+            await update.message.reply_text("متن پیام رو بفرست:")
+        else:
+            await update.message.reply_text("❌ آیدی نامعتبره.")
+        return
+
+    if awaiting == "dm_text":
+        target = context.user_data.pop("dm_target", None)
+        context.user_data.pop("awaiting", None)
+        if target:
+            try:
+                await context.bot.send_message(chat_id=target, text=text)
+                await update.message.reply_text("✅ پیام ارسال شد.", reply_markup=main_admin_menu())
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطا: {e}", reply_markup=main_admin_menu())
+        return
+
+    if awaiting and awaiting.startswith("text_"):
+        key = awaiting[5:]
+        db.setdefault("texts", {})[key] = text
+        save_db(db)
+        await update.message.reply_text("✅ متن آپدیت شد.", reply_markup=main_admin_menu())
+        context.user_data.pop("awaiting", None); return
+
+    if awaiting == "admin_add":
+        if text.lstrip("-").isdigit():
+            uid = int(text)
+            db.setdefault("admins_extra", [])
+            if uid not in db["admins_extra"]:
+                db["admins_extra"].append(uid)
+                save_db(db)
+            await update.message.reply_text(f"✅ {uid} به لیست ادمین‌ها اضافه شد.", reply_markup=main_admin_menu())
+        else:
+            await update.message.reply_text("❌ آیدی نامعتبره.")
+        context.user_data.pop("awaiting", None); return
+
+# ═══════════════════════════════════════════
+#   دستورات سریع: حذف فایل / تغییر کپشن
+# ═══════════════════════════════════════════
+async def delfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(get_text("no_access")); return
+    if not context.args:
+        await update.message.reply_text("استفاده: /delfile کد_فایل"); return
+    code = context.args[0]
+    db = load_db()
+    if code in db["files"]:
+        del db["files"][code]
+        save_db(db)
+        await update.message.reply_text("✅ فایل حذف شد.")
+    else:
+        await update.message.reply_text("❌ همچین کدی پیدا نشد.")
+
+async def caption_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(get_text("no_access")); return
+    if len(context.args) < 2:
+        await update.message.reply_text("استفاده: /caption کد_فایل متن جدید"); return
+    code = context.args[0]
+    new_caption = " ".join(context.args[1:])
+    db = load_db()
+    if code in db["files"]:
+        db["files"][code]["custom_caption"] = new_caption
+        save_db(db)
+        await update.message.reply_text("✅ کپشن آپدیت شد.")
+    else:
+        await update.message.reply_text("❌ همچین کدی پیدا نشد.")
+
+# ═══════════════════════════════════════════
+#   روتر کلی کالبک‌ها
+# ═══════════════════════════════════════════
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.data.startswith("like_") or q.data.startswith("dislike_"):
+        await handle_reaction(update, context)
+    elif q.data.startswith("checkjoin_"):
+        await callback_check_join(update, context)
+    elif q.data.startswith("checktask_"):
+        await callback_check_task(update, context)
+    else:
+        await admin_router(update, context)
+
+# ═══════════════════════════════════════════
+#   اجرا
+# ═══════════════════════════════════════════
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("delfile", delfile_cmd))
+    app.add_handler(CommandHandler("caption", caption_cmd))
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE,
+        handle_file
+    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    print("🤖 ربات شروع به کار کرد...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
